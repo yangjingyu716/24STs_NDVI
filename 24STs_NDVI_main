@@ -16,7 +16,7 @@ var sTermInfo = new Array(0,21208,42467,63836,85337,107014,128867,150921,173149,
 function sTermDate(y,n) {
    return new Date( ( 31556925974.7*(y-1900) + sTermInfo[n]*60000  ) + Date.UTC(1900,0,6,2,5) );
 }
-var year = 2014                                                //change the year
+var year = ****                                               //change the year
 var dates = new Array();
 for(var i = 0; i < 24; i++){
   var sterm = sTermDate(year, i);
@@ -220,6 +220,6 @@ for(var a = 0; a < 24; a++){
   var solarTerm_name = solarTerm[a];
   for(var b=0; b<1; b++){
     var b_time=(startDate).format('yyyyMMdd').getInfo();
-    exportImage(QC_img_num.select('num_observations'), b_time, boundary, "24STs_NDVI_QC", solarTerm_name, '24_NDVI_2021', 250);
+    exportImage(QC_img_num.select('num_observations'), b_time, boundary, "24STs_NDVI_QC", solarTerm_name, '24_NDVI_****', 250);
   }
 };
