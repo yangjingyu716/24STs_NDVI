@@ -1,0 +1,225 @@
+var boundary = ee.FeatureCollection("ROI");      //change the region of intest(ROI)
+Map.centerObject(boundary, 3);
+Map.addLayer(boundary);
+var smoother = require('users/marcyinfeng/shared:smoother');
+var palettes = require('users/gena/packages:palettes');
+
+// -----------------------------------calculate 24 solar terms------------------------------//
+/*
+Calculate the times and intervals corresponding to the 24 solar terms
+*/
+var solarTerm = new Array("LC","GC","SB","RW","IA","SE","FG","GR","BS","LF","GE","SS"
+                         ,"LH","GH","BA","EH","WD","AE","CD","FF","BW","LS","HS","WS")
+var sTermInfo = new Array(0,21208,42467,63836,85337,107014,128867,150921,173149,195551,218072,240693,263343
+                           ,285989,308563,331033,353350,375494,397447,419210,440795,462224,483532,504758)
+
+function sTermDate(y,n) {
+   return new Date( ( 31556925974.7*(y-1900) + sTermInfo[n]*60000  ) + Date.UTC(1900,0,6,2,5) );
+}
+var year = 2014                                                //change the year
+var dates = new Array();
+for(var i = 0; i < 24; i++){
+  var sterm = sTermDate(year, i);
+  var stdateStr = sterm.getFullYear()+"-"+(sterm.getMonth()+1)+"-"+sterm.getUTCDate();
+  dates.push(stdateStr)
+};
+var step = ee.List([]);
+for(var d = 0; d < 23; d++){
+  var startDate = ee.Date(dates[d]);
+  var endDate = ee.Date(dates[d + 1]);
+  var step_d = ee.Number(endDate.difference(startDate, 'day'));
+  var step_new = step_d.subtract(1);
+  step=step.add(step_new);
+};
+//print('date', dates);
+print('step', step)
+
+// -----------------------------------------------------------------------------------------------------------------
+/*
+##################re-author by: Jingyu Yang###############
+*/
+// -----------------------------------base functions------------------------------//
+// A function to mask out pixels that did not have observations.
+var maskEmptyPixels = function(image) {
+  // Find pixels that had observations.
+  var withObs = image.select('num_observations').gt(0);
+  return image.updateMask(withObs);
+};
+
+// A function to mask out cloudy pixels.
+var maskClouds = function(image) {
+  // Select the QA band.
+  var QA = image.select('QC_250m');
+  // Make a mask to get bit 10, the internal_cloud_algorithm_flag bit.
+  var bitMask = 1 << 10;
+  // Return an image masking out cloudy areas.
+  return image.updateMask(QA.bitwiseAnd(bitMask).eq(0));
+};
+
+/*
+  Acquisition of MODIS images 
+*/
+// *** A function to obtain MODIS EVI series ***
+var getModisCol = function(region, startDate, endDate){
+  var modis_col = ee.ImageCollection('MODIS/061/MOD09GQ')
+                  .filterBounds(region)
+                  .filterDate(startDate, endDate)
+                  .map(maskEmptyPixels)
+                  .map(maskClouds)
+                  .map(function(image){
+                    return image.clip(region);
+                  });
+  
+  return modis_col;                
+};
+
+/*
+NDVI composite function (composite by date, maximum value)
+*/
+var getVIData = function(geometry, startDate, endDate, index, median_day, step, approach){
+  
+  //Image Collection Acquisition
+  var imgCol_modis = getModisCol(geometry, startDate, endDate);
+  var rawBands = ['sur_refl_b01', 'sur_refl_b02'];
+  var newBands = ['red', 'nir'];
+  
+  //Iterate over the NDVI of the computed image collection
+  var modis_ndvi = imgCol_modis.map(function(image){
+    image = image.clip(geometry).select(rawBands, newBands);
+    return image.normalizedDifference(['nir', 'red']).multiply(10000).int().rename('ndvi')
+                .set('system:time_start', image.get('system:time_start'));
+  }).select('ndvi');
+  
+  var obs = modis_ndvi.sort('system:time_start');
+  //NDVI compositing
+  var fillGap = function(value){
+    var image_date = startDate.advance(ee.Number(value).int(), 'day');
+    var image = obs.filterDate(image_date, image_date.advance(1, 'day')).mean();
+    var time_start = image_date.millis();
+    var start_date = image_date.advance( 0, 'day')
+    var end_date   = image_date.advance( median_day, 'day');
+  
+  //Different compositing methods 
+      if(approach == "median"){
+        var wobs_median = obs.filterDate(start_date, end_date).median();
+      }
+      else if(approach == "mean"){
+        var wobs_median = obs.filterDate(start_date, end_date).mean();
+      }
+      else if(approach == "max"){
+        var wobs_median = obs.filterDate(start_date, end_date).max();
+      }
+      else {
+        var wobs_median = obs.filterDate(start_date, end_date).min();
+      }
+
+    var zero_image = ee.Image(0);
+    zero_image = zero_image.updateMask(zero_image);
+    var interp_ndvi = ee.Algorithms.If(wobs_median.bandNames(), wobs_median, zero_image);
+    return ee.Image(interp_ndvi).float().rename(index).set('system:time_start', time_start);
+  };
+  
+  //Generate a recurring list at regular intervals
+  var diff = endDate.difference(startDate, 'day');
+  var doy = ee.List.sequence(0, diff, step);
+  
+  //Iterate over the NDVI of the compositing image collection
+  var mobs = doy.map(fillGap);
+  //print('mobs', mobs)
+  obs = ee.ImageCollection.fromImages(mobs);
+  //print('obs',obs);
+  
+  var sobs_img = obs.toBands().clip(geometry).regexpRename('^(.*)', 'b_$1');
+
+  return sobs_img;
+};
+
+/*
+ export function
+*/ 
+function exportImage(res_img, year, geometry, fileName, fileName2, folderName, resolution) {
+  Export.image.toDrive({
+    image:res_img.int(),
+    description: fileName + '_' + year + '_' + fileName2,
+    region:geometry,
+    maxPixels:1e13,
+    scale:resolution,
+    folder:folderName
+  });
+}
+
+// -----------------------------------output------------------------------//
+
+for(var a = 0; a < 24; a++){
+  var startDate = ee.Date(dates[a]);
+  print('ndvi_startDate', startDate);
+  var last_median_day = 15
+  if(a == 23){
+    var endDate = startDate.advance(last_median_day, 'day');
+  }
+  else{
+    var endDate = ee.Date(dates[a + 1]);
+  }
+  //print('ndvi_endDate', endDate);
+  var index = 'ndvi'; 
+  var median_day = ee.Number(endDate.difference(startDate, 'day'));
+  //print("median_day", median_day);
+  //var median_day = ee.Number(step.get(0));
+  var step = median_day;
+  var ndvi_img = getVIData(boundary, startDate, endDate, index,  median_day, step, "max");
+  print('ndvi_img', ndvi_img);
+  
+  //image visualization
+  for(var b = 0; b<1; b++){
+    var palette = palettes.colorbrewer.RdYlGn[11];
+    var b_time=(startDate).format('yyyyMMdd').getInfo();
+    Map.addLayer(ndvi_img.select('b_'+b+'_ndvi'), {min: -2000, max: 10000, palette: palette}, "24STs_NDVI_" + b_time)
+  };
+  //Data export
+  var solarTerm_name = solarTerm[a];
+  for(var b=0; b<1; b++){
+    var b_time=(startDate).format('yyyyMMdd').getInfo();
+    exportImage(ndvi_img.select('b_'+b+'_ndvi'), b_time, boundary, "24STs_NDVI", solarTerm_name, '24_NDVI_2015', 250);
+  }
+};
+
+
+// -----------------------------------QC_Band------------------------------//
+var getModisCol_QC = function(region, startDate, endDate){
+  var modis_col = ee.ImageCollection('MODIS/061/MOD09GQ')
+                  .filterBounds(region)
+                  .filterDate(startDate, endDate)
+                  .map(function(image){
+                    return image.clip(region);
+                  });
+  //var totalObsCount = modis_col.select('num_observations').count();
+  var collectionCloudMasked = modis_col.map(maskClouds);
+  var clearObsCount = collectionCloudMasked.select('num_observations').count().unmask(0)
+  return clearObsCount;                
+};
+
+for(var a = 0; a < 24; a++){
+  var startDate = ee.Date(dates[a]);
+  var last_median_day = 15
+  if(a == 23){
+    var endDate = startDate.advance(last_median_day, 'day');
+  }
+  else{
+    var endDate = ee.Date(dates[a + 1]);
+  }
+  var median_day = ee.Number(endDate.difference(startDate, 'day'));
+  var step = median_day;
+  var QC_img_num = getModisCol_QC(boundary, startDate, endDate,  median_day, step);
+  
+  //image visualization
+  for(var b = 0; b<1; b++){
+    var b_time=(startDate).format('yyyyMMdd').getInfo();
+    Map.addLayer(QC_img_num.select('num_observations'), {min: 0, max: 15}, "24STs_NDVI_QC_" + b_time)
+  };
+  //Data export
+  var solarTerm_name = solarTerm[a];
+  for(var b=0; b<1; b++){
+    var b_time=(startDate).format('yyyyMMdd').getInfo();
+    exportImage(QC_img_num.select('num_observations'), b_time, boundary, "24STs_NDVI_QC", solarTerm_name, '24_NDVI_2021', 250);
+  }
+};
